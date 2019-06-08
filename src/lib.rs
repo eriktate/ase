@@ -58,7 +58,6 @@ pub enum Chunk {
         x: i16,
         y: i16,
         opacity: u8,
-        cel_type: u16,
         cel: Cel,
     },
     CelExtra,
@@ -128,23 +127,31 @@ impl Cel {
         }
     }
 
-    fn new_compressed(raw: &[u8]) -> Cel {
-        // let mut decoded = Vec::new();
-        // ZlibDecoder::new(&raw[4..]).read(&mut decoded).unwrap();
+    fn new_compressed(color_depth: &ColorDepth, raw: &[u8]) -> Cel {
+        let width =  read_word(&raw[0..]);
+        let height = read_word(&raw[2..]);
+        let mut data = Vec::with_capacity((width * height) as usize * color_depth.offset());
+        // for some odd reason, we have to skip the first two bytes of compressed data (something
+        // about a zlib header)
+        ZlibDecoder::new(&raw[4..]).read_to_end(&mut data).unwrap();
 
-        Cel::Compressed{
-            width: read_word(&raw[0..]),
-            height: read_word(&raw[2..]),
-            // data: decoded,
-            data: Vec::from(&raw[4..]),
+        Cel::Raw{
+            width,
+            height,
+            pixels: Pixel::new_pixels(&color_depth, width, height, &data),
         }
+        // Cel::Compressed{
+        //     width,
+        //     height,
+        //     data,
+        // }
     }
 
     fn new(header: &Header, cel_type: u16, raw: &[u8]) -> Cel {
         match cel_type {
             0 => Cel::new_raw(&header.color_depth, raw),
             1 => Cel::new_linked(raw),
-            2 => Cel::new_compressed(raw),
+            2 => Cel::new_compressed(&header.color_depth, raw),
             _ => panic!("Invalid cel type!"),
         }
     }
@@ -241,7 +248,7 @@ impl Pixel {
 
         let mut pixels = Vec::new();
         let mut offset = 0;
-        for _ in 0..width * height {
+        for _ in 0..(width * height) {
             pixels.push(pixel_fn(&raw[offset..]));
             offset += color_depth.offset();
         }
@@ -300,9 +307,8 @@ impl Chunk {
             x: read_short(&raw[2..]),
             y: read_short(&raw[4..]),
             opacity: raw[6],
-            cel_type,
             // 7 unused bytes
-            cel: Cel::new(header, cel_type, &raw[14..]),
+            cel: Cel::new(header, cel_type, &raw[16..]),
         }
     }
 
