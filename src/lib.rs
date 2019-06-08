@@ -1,3 +1,8 @@
+use flate2::read::ZlibDecoder;
+use std::io::Read;
+
+type Fixed = fixed::FixedI32<fixed::frac::U2>;
+
 const HEADER_SIZE: usize = 128;
 const FRAME_HEADER_SIZE: usize = 16;
 
@@ -57,7 +62,13 @@ pub enum Chunk {
         cel: Cel,
     },
     CelExtra,
-    ColorProfile,
+    ColorProfile{
+        profile_type: u16,
+        flags: u16,
+        gamma: Fixed,
+        icc_size: u32,
+        icc_data: Vec<u8>,
+    },
     Mask{
         x: i16,
         y: i16,
@@ -80,7 +91,6 @@ pub enum Chunk {
         keys: Vec<SliceKey>,
     },
     Path,
-    Invalid,
 }
 
 #[derive(Debug)]
@@ -118,20 +128,24 @@ impl Cel {
         }
     }
 
-    fn new_compressed(size: u32, raw: &[u8]) -> Cel {
+    fn new_compressed(raw: &[u8]) -> Cel {
+        // let mut decoded = Vec::new();
+        // ZlibDecoder::new(&raw[4..]).read(&mut decoded).unwrap();
+
         Cel::Compressed{
             width: read_word(&raw[0..]),
             height: read_word(&raw[2..]),
-            data: Vec::from(&raw[4..(size-4) as usize]),
+            // data: decoded,
+            data: Vec::from(&raw[4..]),
         }
     }
 
-    fn new(header: &Header, cel_type: u16, size: u32, raw: &[u8]) -> Cel {
+    fn new(header: &Header, cel_type: u16, raw: &[u8]) -> Cel {
         match cel_type {
-            1 => Cel::new_raw(&header.color_depth, raw),
-            2 => Cel::new_linked(raw),
-            3 => Cel::new_compressed(size, raw),
-            _ => panic!("Invalid state!"),
+            0 => Cel::new_raw(&header.color_depth, raw),
+            1 => Cel::new_linked(raw),
+            2 => Cel::new_compressed(raw),
+            _ => panic!("Invalid cel type!"),
         }
     }
 }
@@ -252,21 +266,33 @@ impl Chunk {
         }
     }
 
+    fn new_color_profile(raw: &[u8]) -> Chunk {
+        Chunk::ColorProfile{
+            profile_type: read_word(&raw[0..]),
+            flags: read_word(&raw[2..]),
+            gamma: read_fixed(&raw[4..]),
+            // TODO (erik): Parse ICC data.
+            icc_size: 0,
+            icc_data: Vec::new(),
+        }
+    }
+
     fn new_mask(raw: &[u8]) -> Chunk {
         let width = read_word(&raw[4..]);
         let height = read_word(&raw[6..]);
         let (mask_name, offset) = read_string(&raw[8..]);
+        let data_size = (height * ((width + 7)/8)) as usize;
         Chunk::Mask{
             x: read_short(&raw[0..]),
             y: read_short(&raw[2..]),
             width,
             height,
             mask_name,
-            data: Vec::from(&raw[10 + offset..(height * ((width + 7)/8)) as usize]),
+            data: Vec::from(&raw[10 + offset..10 + offset + data_size]),
         }
     }
 
-    fn new_cel(header: &Header, size: u32, raw: &[u8]) -> Chunk {
+    fn new_cel(header: &Header, raw: &[u8]) -> Chunk {
         let cel_type = read_word(&raw[7..]);
 
         Chunk::Cel{
@@ -276,7 +302,7 @@ impl Chunk {
             opacity: raw[6],
             cel_type,
             // 7 unused bytes
-            cel: Cel::new(header, cel_type, size, &raw[14..]),
+            cel: Cel::new(header, cel_type, &raw[14..]),
         }
     }
 
@@ -285,6 +311,7 @@ impl Chunk {
             size: read_dword(&raw[0..]),
             first_color_index: read_dword(&raw[4..]),
             last_color_index: read_dword(&raw[8..]),
+            // TODO (erik): Parse entries
             entries: Vec::new(),
         }
     }
@@ -295,6 +322,7 @@ impl Chunk {
             key_count: read_dword(&raw[0..]),
             flags: read_dword(&raw[4..]),
             name: name,
+            // TODO (erik): Parse keys.
             keys: Vec::new(),
         }
     }
@@ -307,15 +335,15 @@ impl Chunk {
             0x0004 => Chunk::OldPallette,
             0x0011 => Chunk::OtherOldPallette,
             0x2004 => Chunk::new_layer(&raw[6..]),
-            0x2005 => Chunk::new_cel(header, size, &raw[6..]),
+            0x2005 => Chunk::new_cel(header, &raw[6..size as usize]),
             0x2006 => Chunk::CelExtra,
-            0x2007 => Chunk::ColorProfile,
+            0x2007 => Chunk::new_color_profile(&raw[6..]),
             0x2016 => Chunk::new_mask(&raw[6..]),
             0x2017 => Chunk::Path,
             0x2018 => Chunk::FrameTags,
             0x2019 => Chunk::new_pallette(&raw[6..]),
             0x2022 => Chunk::new_slice(&raw[6..]),
-            _ => Chunk::Invalid,
+            _ => panic!("Invalid chunk type!"),
         }, size)
     }
 }
@@ -417,19 +445,6 @@ impl Frame {
     }
 }
 
-// impl ChunkWrapper {
-//     pub fn new(header: &Header, raw: &[u8]) -> ChunkWrapper {
-//         let size = read_dword(&raw[0..]);
-//         let chunk_type = read_word(&raw[4..]);
-
-//         ChunkWrapper{
-//             size,
-//             chunk_type,
-//             chunk: Chunk::new(header, chunk_type, size, &raw[6..]),
-//         }
-//     }
-// }
-
 fn read_dword(bytes: &[u8]) -> u32 {
     ((bytes[0] as u32) << 0) +
     ((bytes[1] as u32) << 8) +
@@ -447,11 +462,22 @@ fn read_short(bytes: &[u8]) -> i16 {
     ((bytes[1] as i16) << 8)
 }
 
+fn read_long(bytes: &[u8]) -> i32 {
+    ((bytes[0] as i32) << 0) +
+    ((bytes[1] as i32) << 8) +
+    ((bytes[2] as i32) << 16) +
+    ((bytes[3] as i32) << 24)
+}
+
+fn read_fixed(bytes: &[u8]) -> Fixed {
+    Fixed::from_bits(read_long(bytes))
+}
+
 fn read_string(bytes: &[u8]) -> (String, usize) {
     let length = read_word(&bytes[0..]) as usize;
     // TODO (erik): Maybe make this safe? Not sure what to do with the error, though.
-    let raw_str = unsafe { std::str::from_utf8_unchecked(&bytes[2..length]) };
-    (String::from(raw_str), length)
+    let raw_str = unsafe { std::str::from_utf8_unchecked(&bytes[2..length + 2]) };
+    (String::from(raw_str), length + 2)
 }
 
 #[cfg(test)]
