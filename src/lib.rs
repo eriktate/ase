@@ -1,5 +1,6 @@
 use flate2::read::ZlibDecoder;
 use std::io::Read;
+use std::fmt;
 
 type Fixed = fixed::FixedI32<fixed::frac::U2>;
 
@@ -30,37 +31,84 @@ pub struct Frame {
     pub frame_duration: u16,
     pub new_chunks: u32,
     pub chunks: Vec<Chunk>,
+    pub layers: Vec<Layer>,
+}
+
+impl Frame {
+    pub fn new(header: &Header, raw: &[u8]) -> Frame {
+        let mut frame = Frame{
+            size: read_dword(&raw[0..]),
+            magic_number: read_word(&raw[4..]),
+            old_chunks: read_word(&raw[6..]),
+            frame_duration: read_word(&raw[8..]),
+            new_chunks: read_dword(&raw[12..]),
+            chunks: Vec::new(),
+            layers: Vec::new(),
+        };
+
+        let mut offset = FRAME_HEADER_SIZE;
+        let chunk_count = if frame.new_chunks == 0 {
+            frame.old_chunks as u32
+        } else {
+            frame.new_chunks
+        };
+
+        for _ in 0..chunk_count {
+            let (chunk, size) = Chunk::new(header, &raw[offset..]);
+            offset += size as usize;
+            match chunk {
+                Chunk::Layer(layer) => frame.layers.push(layer),
+                Chunk::Cel(cw) => frame.layers[cw.layer_index as usize].cels.push(cw.cel),
+                _ => frame.chunks.push(chunk),
+            }
+        }
+
+        frame
+    }
 }
 
 #[derive(Debug)]
-pub struct ChunkWrapper {
-    pub size: u32,
-    pub chunk_type: u16,
-    pub chunk: Chunk,
+pub struct Layer {
+    flags: u16,
+    layer_type: LayerType,
+    child_level: u16,
+    default_width: u16,
+    default_height: u16,
+    blend_mode: u16,
+    opacity: u8,
+    name: String,
+    cels: Vec<Cel>,
+}
+
+#[derive(Debug)]
+enum LayerType {
+    Normal,
+    Group,
+}
+
+impl From<u16> for LayerType {
+    fn from(raw: u16) -> LayerType {
+        match raw {
+            0 => LayerType::Normal,
+            1 => LayerType::Group,
+            _ => panic!("Invalid layer type!"),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum Chunk {
     OldPallette,
     OtherOldPallette,
-    Layer {
-        flags: u16,
-        layer_type: u16,
-        child_level: u16,
-        default_width: u16,
-        default_height: u16,
-        blend_mode: u16,
-        opacity: u8,
-        name: String,
+    Layer(Layer),
+    Cel(CelWrapper),
+    CelExtra{
+        flags: u32,
+        x: Fixed,
+        y: Fixed,
+        width: Fixed,
+        height: Fixed,
     },
-    Cel{
-        layer_index: u16,
-        x: i16,
-        y: i16,
-        opacity: u8,
-        cel: Cel,
-    },
-    CelExtra,
     ColorProfile{
         profile_type: u16,
         flags: u16,
@@ -90,6 +138,128 @@ pub enum Chunk {
         keys: Vec<SliceKey>,
     },
     Path,
+}
+
+impl Chunk {
+    fn new_layer(raw: &[u8]) -> Chunk {
+        let (name, _) = read_string(&raw[16..]);
+        let layer = Layer{
+            flags: read_word(&raw[0..]),
+            layer_type: LayerType::from(read_word(&raw[2..])),
+            child_level: read_word(&raw[4..]),
+            default_width: read_word(&raw[6..]),
+            default_height: read_word(&raw[8..]),
+            blend_mode: read_word(&raw[10..]),
+            opacity: raw[12],
+            // 3 unused bytes
+            name,
+            cels: Vec::new(),
+        };
+
+        Chunk::Layer(layer)
+    }
+
+    fn new_color_profile(raw: &[u8]) -> Chunk {
+        Chunk::ColorProfile{
+            profile_type: read_word(&raw[0..]),
+            flags: read_word(&raw[2..]),
+            gamma: read_fixed(&raw[4..]),
+            // TODO (erik): Parse ICC data.
+            icc_size: 0,
+            icc_data: Vec::new(),
+        }
+    }
+
+    fn new_mask(raw: &[u8]) -> Chunk {
+        let width = read_word(&raw[4..]);
+        let height = read_word(&raw[6..]);
+        let (mask_name, offset) = read_string(&raw[8..]);
+        let data_size = (height * ((width + 7)/8)) as usize;
+        Chunk::Mask{
+            x: read_short(&raw[0..]),
+            y: read_short(&raw[2..]),
+            width,
+            height,
+            mask_name,
+            data: Vec::from(&raw[10 + offset..10 + offset + data_size]),
+        }
+    }
+
+    fn new_cel(header: &Header, raw: &[u8]) -> Chunk {
+        let cel_type = read_word(&raw[7..]);
+
+        let cw = CelWrapper{
+            layer_index: read_word(&raw[0..]),
+            x: read_short(&raw[2..]),
+            y: read_short(&raw[4..]),
+            opacity: raw[6],
+            // 7 unused bytes
+            cel: Cel::new(header, cel_type, &raw[16..]),
+        };
+
+        Chunk::Cel(cw)
+    }
+
+    fn new_cel_extra(raw: &[u8]) -> Chunk {
+        Chunk::CelExtra{
+            flags: read_dword(&raw[0..]),
+            x: read_fixed(&raw[4..]),
+            y: read_fixed(&raw[8..]),
+            width: read_fixed(&raw[12..]),
+            height: read_fixed(&raw[16..])
+        }
+    }
+
+    fn new_pallette(raw: &[u8]) -> Chunk {
+        Chunk::Pallette{
+            size: read_dword(&raw[0..]),
+            first_color_index: read_dword(&raw[4..]),
+            last_color_index: read_dword(&raw[8..]),
+            // TODO (erik): Parse entries
+            entries: Vec::new(),
+        }
+    }
+
+    fn new_slice(raw: &[u8]) -> Chunk {
+        let (name, _) = read_string(&raw[8..]);
+        Chunk::Slice{
+            key_count: read_dword(&raw[0..]),
+            flags: read_dword(&raw[4..]),
+            name: name,
+            // TODO (erik): Parse keys.
+            keys: Vec::new(),
+        }
+    }
+
+    pub fn new(header: &Header, raw: &[u8]) -> (Chunk, u32) {
+        let size = read_dword(&raw[0..]);
+        let chunk_type = read_word(&raw[4..]);
+
+        (match chunk_type {
+            0x0004 => Chunk::OldPallette,
+            0x0011 => Chunk::OtherOldPallette,
+            0x2004 => Chunk::new_layer(&raw[6..]),
+            0x2005 => Chunk::new_cel(header, &raw[6..size as usize]),
+            0x2006 => Chunk::new_cel_extra(&raw[6..]),
+            0x2007 => Chunk::new_color_profile(&raw[6..]),
+            0x2016 => Chunk::new_mask(&raw[6..]),
+            0x2017 => Chunk::Path,
+            0x2018 => Chunk::FrameTags,
+            0x2019 => Chunk::new_pallette(&raw[6..]),
+            0x2022 => Chunk::new_slice(&raw[6..]),
+            _ => panic!("Invalid chunk type!"),
+        }, size)
+    }
+}
+
+
+#[derive(Debug)]
+pub struct CelWrapper {
+    layer_index: u16,
+    x: i16,
+    y: i16,
+    opacity: u8,
+    cel: Cel,
 }
 
 #[derive(Debug)]
@@ -135,6 +305,8 @@ impl Cel {
         // about a zlib header)
         ZlibDecoder::new(&raw[4..]).read_to_end(&mut data).unwrap();
 
+        // TODO (erik): Is returning a decompressed, raw cel acceptable behaviour when we find it
+        // compressed?
         Cel::Raw{
             width,
             height,
@@ -191,7 +363,7 @@ impl ColorDepth {
     }
 }
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub enum Pixel {
     RGBA{
         r: u8,
@@ -205,6 +377,12 @@ pub enum Pixel {
     },
     Indexed{
         index: u8,
+    }
+}
+
+impl fmt::Debug for Pixel {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "")
     }
 }
 
@@ -257,103 +435,6 @@ impl Pixel {
     }
 }
 
-impl Chunk {
-    fn new_layer(raw: &[u8]) -> Chunk {
-        let (name, _) = read_string(&raw[16..]);
-        Chunk::Layer{
-            flags: read_word(&raw[0..]),
-            layer_type: read_word(&raw[2..]),
-            child_level: read_word(&raw[4..]),
-            default_width: read_word(&raw[6..]),
-            default_height: read_word(&raw[8..]),
-            blend_mode: read_word(&raw[10..]),
-            opacity: raw[12],
-            // 3 unused bytes
-            name,
-        }
-    }
-
-    fn new_color_profile(raw: &[u8]) -> Chunk {
-        Chunk::ColorProfile{
-            profile_type: read_word(&raw[0..]),
-            flags: read_word(&raw[2..]),
-            gamma: read_fixed(&raw[4..]),
-            // TODO (erik): Parse ICC data.
-            icc_size: 0,
-            icc_data: Vec::new(),
-        }
-    }
-
-    fn new_mask(raw: &[u8]) -> Chunk {
-        let width = read_word(&raw[4..]);
-        let height = read_word(&raw[6..]);
-        let (mask_name, offset) = read_string(&raw[8..]);
-        let data_size = (height * ((width + 7)/8)) as usize;
-        Chunk::Mask{
-            x: read_short(&raw[0..]),
-            y: read_short(&raw[2..]),
-            width,
-            height,
-            mask_name,
-            data: Vec::from(&raw[10 + offset..10 + offset + data_size]),
-        }
-    }
-
-    fn new_cel(header: &Header, raw: &[u8]) -> Chunk {
-        let cel_type = read_word(&raw[7..]);
-
-        Chunk::Cel{
-            layer_index: read_word(&raw[0..]),
-            x: read_short(&raw[2..]),
-            y: read_short(&raw[4..]),
-            opacity: raw[6],
-            // 7 unused bytes
-            cel: Cel::new(header, cel_type, &raw[16..]),
-        }
-    }
-
-    fn new_pallette(raw: &[u8]) -> Chunk {
-        Chunk::Pallette{
-            size: read_dword(&raw[0..]),
-            first_color_index: read_dword(&raw[4..]),
-            last_color_index: read_dword(&raw[8..]),
-            // TODO (erik): Parse entries
-            entries: Vec::new(),
-        }
-    }
-
-    fn new_slice(raw: &[u8]) -> Chunk {
-        let (name, _) = read_string(&raw[8..]);
-        Chunk::Slice{
-            key_count: read_dword(&raw[0..]),
-            flags: read_dword(&raw[4..]),
-            name: name,
-            // TODO (erik): Parse keys.
-            keys: Vec::new(),
-        }
-    }
-
-    pub fn new(header: &Header, raw: &[u8]) -> (Chunk, u32) {
-        let size = read_dword(&raw[0..]);
-        let chunk_type = read_word(&raw[4..]);
-
-        (match chunk_type {
-            0x0004 => Chunk::OldPallette,
-            0x0011 => Chunk::OtherOldPallette,
-            0x2004 => Chunk::new_layer(&raw[6..]),
-            0x2005 => Chunk::new_cel(header, &raw[6..size as usize]),
-            0x2006 => Chunk::CelExtra,
-            0x2007 => Chunk::new_color_profile(&raw[6..]),
-            0x2016 => Chunk::new_mask(&raw[6..]),
-            0x2017 => Chunk::Path,
-            0x2018 => Chunk::FrameTags,
-            0x2019 => Chunk::new_pallette(&raw[6..]),
-            0x2022 => Chunk::new_slice(&raw[6..]),
-            _ => panic!("Invalid chunk type!"),
-        }, size)
-    }
-}
-
 #[derive(Debug)]
 pub struct SliceKey {
     pub frame_number: u32,
@@ -402,6 +483,16 @@ impl Ase {
         }
 
     }
+
+    /// Renders the Ase structure into an array of pixel values. The final format of this data
+    /// depends on the color depth defined in the Header.
+    ///
+    /// A render is generated by iterating over the cel chunks in each layer and applying the color
+    /// data with the configured opacity. If there are multiple frames, this procedure is repeated
+    /// for each frame generating a strip of frame data.
+    pub fn render(&self) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 impl Header {
@@ -423,33 +514,6 @@ impl Header {
     }
 }
 
-impl Frame {
-    pub fn new(header: &Header, raw: &[u8]) -> Frame {
-        let mut frame = Frame{
-            size: read_dword(&raw[0..]),
-            magic_number: read_word(&raw[4..]),
-            old_chunks: read_word(&raw[6..]),
-            frame_duration: read_word(&raw[8..]),
-            new_chunks: read_dword(&raw[12..]),
-            chunks: Vec::new(),
-        };
-
-        let mut offset = FRAME_HEADER_SIZE;
-        let chunk_count = if frame.new_chunks == 0 {
-            frame.old_chunks as u32
-        } else {
-            frame.new_chunks
-        };
-
-        for _ in 0..chunk_count {
-            let (chunk, size) = Chunk::new(header, &raw[offset..]);
-            offset += size as usize;
-            frame.chunks.push(chunk);
-        }
-
-        frame
-    }
-}
 
 fn read_dword(bytes: &[u8]) -> u32 {
     ((bytes[0] as u32) << 0) +
