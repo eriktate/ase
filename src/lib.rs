@@ -451,14 +451,46 @@ impl ColorDepth {
     }
 }
 
+pub struct RGBA {
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+}
+
+impl RGBA {
+    fn new(raw: &[u8]) -> RGBA {
+        RGBA{
+            r: raw[0],
+            g: raw[1],
+            b: raw[2],
+            a: raw[3],
+        }
+    }
+}
+
+impl RGBA {
+    fn overlay(&self, overlay: &RGBA, opacity: f32) -> RGBA {
+        let overlay_alpha = (overlay.a as f32) / 255.0 * opacity;
+        let alpha = (self.a as f32) / 255.0;
+
+        let a = (1.0 - overlay_alpha) * alpha + overlay_alpha;
+        let r = (((1.0 - overlay_alpha) * alpha * (self.r as f32) + overlay_alpha * overlay.r as f32)/a) as u8;
+        let g = (((1.0 - overlay_alpha) * alpha * (self.g as f32) + overlay_alpha * overlay.g as f32)/a) as u8;
+        let b = (((1.0 - overlay_alpha) * alpha * (self.b as f32) + overlay_alpha * overlay.b as f32)/a) as u8;
+
+        RGBA{
+            r,
+            g,
+            b,
+            a: a as u8,
+        }
+    }
+}
+
 // #[derive(Debug)]
 pub enum Pixel {
-    RGBA{
-        r: u8,
-        g: u8,
-        b: u8,
-        a: u8,
-    },
+    RGBA(RGBA),
     GrayScale{
         value: u8,
         alpha: u8,
@@ -476,12 +508,7 @@ impl fmt::Debug for Pixel {
 
 impl Pixel {
     fn new_rgba(raw: &[u8]) -> Pixel {
-        Pixel::RGBA{
-            r: raw[0],
-            g: raw[1],
-            b: raw[2],
-            a: raw[3],
-        }
+        Pixel::RGBA(RGBA::new(raw))
     }
 
     fn new_gray_scale(raw: &[u8]) -> Pixel {
@@ -499,7 +526,7 @@ impl Pixel {
 
     fn new(color_depth: &ColorDepth, raw: &[u8]) -> Pixel {
         match color_depth {
-            ColorDepth::RGBA => Pixel::new_rgba(raw),
+            ColorDepth::RGBA => Pixel::RGBA(RGBA::new(raw)),
             ColorDepth::GrayScale => Pixel::new_gray_scale( raw),
             ColorDepth::Indexed => Pixel::new_indexed(raw),
         }
@@ -588,17 +615,23 @@ impl Ase {
 
         for frame in &self.frames {
             for layer in &frame.layers {
+                let layer_opacity = (layer.opacity as f32) / 255.0;
                 for cel in &layer.cels {
                     match cel {
                         Cel::Raw(c) => {
+                            let opacity = (c.base.opacity as f32) / 255.0 * layer_opacity;
+                            println!("Opacity: {}", opacity);
                             for (i, pixel) in c.pixels.iter().enumerate() {
                                 match pixel {
-                                    Pixel::RGBA{r, g, b, a} => {
+                                    Pixel::RGBA(p) => {
                                         let idx = c.map_pixel(i, width) * color_depth.offset();
-                                        image_data[idx] = *r;
-                                        image_data[idx+1] = *g;
-                                        image_data[idx+2] = *b;
-                                        image_data[idx+3] = *a;
+                                        let src = RGBA::new(&image_data[idx..]);
+
+                                        let overlayed = src.overlay(p, opacity);
+                                        image_data[idx] = overlayed.r;
+                                        image_data[idx+1] = overlayed.g;
+                                        image_data[idx+2] = overlayed.b;
+                                        image_data[idx+3] = overlayed.a;
                                     },
                                     Pixel::GrayScale{value, alpha} => {
                                         image_data.push(*value);
@@ -619,6 +652,9 @@ impl Ase {
     }
 }
 
+fn overlay(c1: u8, c2: u8, opacity: f32) -> u8 {
+    ((1.0 - opacity)*(c1 as f32) + (opacity*(c2 as f32))) as u8
+}
 
 impl Header {
     pub fn new(raw: &[u8]) -> Header {
