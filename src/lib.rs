@@ -58,7 +58,7 @@ impl Frame {
             offset += size as usize;
             match chunk {
                 Chunk::Layer(layer) => frame.layers.push(layer),
-                Chunk::Cel(cw) => frame.layers[cw.layer_index as usize].cels.push(cw.cel),
+                Chunk::Cel(cel) => frame.layers[cel.layer_index() as usize].cels.push(cel),
                 _ => frame.chunks.push(chunk),
             }
         }
@@ -101,7 +101,7 @@ pub enum Chunk {
     OldPallette,
     OtherOldPallette,
     Layer(Layer),
-    Cel(CelWrapper),
+    Cel(Cel),
     CelExtra{
         flags: u32,
         x: Fixed,
@@ -186,18 +186,7 @@ impl Chunk {
     }
 
     fn new_cel(header: &Header, raw: &[u8]) -> Chunk {
-        let cel_type = read_word(&raw[7..]);
-
-        let cw = CelWrapper{
-            layer_index: read_word(&raw[0..]),
-            x: read_short(&raw[2..]),
-            y: read_short(&raw[4..]),
-            opacity: raw[6],
-            // 7 unused bytes
-            cel: Cel::new(header, cel_type, &raw[16..]),
-        };
-
-        Chunk::Cel(cw)
+        Chunk::Cel(Cel::new(header, &raw))
     }
 
     fn new_cel_extra(raw: &[u8]) -> Chunk {
@@ -252,79 +241,178 @@ impl Chunk {
     }
 }
 
-
 #[derive(Debug)]
-pub struct CelWrapper {
+pub struct CelBase {
     layer_index: u16,
     x: i16,
     y: i16,
     opacity: u8,
-    cel: Cel,
+}
+
+impl CelBase {
+    fn new(raw: &[u8]) -> CelBase {
+        CelBase{
+            layer_index: read_word(&raw[0..]),
+            x: read_short(&raw[2..]),
+            y: read_short(&raw[4..]),
+            opacity: raw[6],
+        }
+    }
+
+    fn offset() -> usize {
+        7
+    }
+}
+
+#[derive(Debug)]
+pub struct RawCel {
+    base: CelBase,
+    width: u16,
+    height: u16,
+    pixels: Vec<Pixel>,
+}
+
+impl RawCel {
+    fn new(color_depth: &ColorDepth, raw: &[u8]) -> RawCel {
+        let offset = CelBase::offset() + 9; // 7 for unused bytes, 2 for cel_type
+        let width = read_word(&raw[offset..]) + 1;
+        let height = read_word(&raw[offset+2..]) + 1;
+
+        RawCel{
+            base: CelBase::new(raw),
+            width,
+            height,
+            pixels: Pixel::new_pixels(color_depth, width, height, &raw[offset+4..]),
+        }
+    }
+
+    fn from_compressed(color_depth: &ColorDepth, raw: &[u8]) -> RawCel {
+        let offset = CelBase::offset() + 9; // 7 for unused bytes, 2 for cel_type
+        let width = read_word(&raw[offset..]);
+        let height = read_word(&raw[offset+2..]);
+        let mut data = Vec::with_capacity((width * height) as usize * color_depth.offset());
+        ZlibDecoder::new(&raw[offset+4..]).read_to_end(&mut data).unwrap();
+
+        RawCel{
+            base: CelBase::new(raw),
+            width,
+            height,
+            pixels: Pixel::new_pixels(color_depth, width, height, &data),
+        }
+    }
+
+    // maps a pixel index to a target width, since RawCel pixel data is often smaller than the
+    // canvas dimensions represented in the Header.
+    fn map_pixel(&self, idx: usize, width: usize) -> usize {
+        let row = idx / (self.width as usize);
+        let col = idx % (self.width as usize);
+
+        (row * width) + (col + self.base.x as usize)
+    }
+}
+
+#[derive(Debug)]
+pub struct LinkedCel {
+    base: CelBase,
+    frame_position: u16,
+}
+
+impl LinkedCel {
+    fn new(raw: &[u8]) -> LinkedCel {
+        LinkedCel{
+            base: CelBase::new(raw),
+            frame_position: read_word(&raw[CelBase::offset()..])
+        }
+    }
+}
+
+// unused
+#[derive(Debug)]
+pub struct CompressedCel {
+    base: CelBase,
+    width: u16,
+    height: u16,
+    data: Vec<u8>, // ZLIB compressed data
+}
+
+impl CompressedCel {
+    fn new(raw: &[u8]) -> CompressedCel {
+        let offset = CelBase::offset();
+        let width = read_word(&raw[offset..]);
+        let height = read_word(&raw[offset+2..]);
+
+        CompressedCel{
+            base: CelBase::new(raw),
+            width,
+            height,
+            data: Vec::from(&raw[offset+4..]),
+        }
+
+    }
 }
 
 #[derive(Debug)]
 pub enum Cel {
-    Raw{
-        width: u16,
-        height: u16,
-        pixels: Vec<Pixel>,
-    },
-    Linked{
-        frame_position: u16,
-    },
-    Compressed {
-        width: u16,
-        height: u16,
-        data: Vec<u8>, // ZLIB compressed data
-    }
+    Raw(RawCel),
+    Linked(LinkedCel),
+    Compressed(CompressedCel)
 }
 
 impl Cel {
-    fn new_raw(color_depth: &ColorDepth, raw: &[u8]) -> Cel {
-        let width = read_word(&raw[0..]);
-        let height = read_word(&raw[2..]);
+    // fn new_raw(color_depth: &ColorDepth, raw: &[u8]) -> Cel {
+    //     let width = read_word(&raw[0..]);
+    //     let height = read_word(&raw[2..]);
 
-        Cel::Raw{
-            width,
-            height,
-            pixels: Pixel::new_pixels(&color_depth, width, height, raw),
-        }
-    }
+    //     Cel::Raw{
+    //         width,
+    //         height,
+    //         pixels: Pixel::new_pixels(&color_depth, width, height, raw),
+    //     }
+    // }
 
-    fn new_linked(raw: &[u8]) -> Cel {
-        Cel::Linked{
-            frame_position: read_word(&raw[0..]),
-        }
-    }
+    // fn new_linked(raw: &[u8]) -> Cel {
+    //     Cel::Linked{
+    //         frame_position: read_word(&raw[0..]),
+    //     }
+    // }
 
-    fn new_compressed(color_depth: &ColorDepth, raw: &[u8]) -> Cel {
-        let width =  read_word(&raw[0..]);
-        let height = read_word(&raw[2..]);
-        let mut data = Vec::with_capacity((width * height) as usize * color_depth.offset());
-        // for some odd reason, we have to skip the first two bytes of compressed data (something
-        // about a zlib header)
-        ZlibDecoder::new(&raw[4..]).read_to_end(&mut data).unwrap();
+    // fn new_compressed(color_depth: &ColorDepth, raw: &[u8]) -> Cel {
+    //     let width =  read_word(&raw[0..]);
+    //     let height = read_word(&raw[2..]);
+    //     let mut data = Vec::with_capacity((width * height) as usize * color_depth.offset());
+    //     ZlibDecoder::new(&raw[4..]).read_to_end(&mut data).unwrap();
 
-        // TODO (erik): Is returning a decompressed, raw cel acceptable behaviour when we find it
-        // compressed?
-        Cel::Raw{
-            width,
-            height,
-            pixels: Pixel::new_pixels(&color_depth, width, height, &data),
-        }
-        // Cel::Compressed{
-        //     width,
-        //     height,
-        //     data,
-        // }
-    }
+    //     // TODO (erik): Is returning a decompressed, raw cel acceptable behaviour when we find it
+    //     // compressed?
+    //     Cel::Raw{
+    //         width,
+    //         height,
+    //         pixels: Pixel::new_pixels(&color_depth, width, height, &data),
+    //     }
+    //     // Cel::Compressed{
+    //     //     width,
+    //     //     height,
+    //     //     data,
+    //     // }
+    // }
 
-    fn new(header: &Header, cel_type: u16, raw: &[u8]) -> Cel {
+    fn new(header: &Header, raw: &[u8]) -> Cel {
+        // NOTE: Compressed Cels actually get returned as their decompressed Raw counterpart. If
+        // actual compressed cels are needed, this match needs changed.
+        let cel_type = read_word(&raw[7..]);
         match cel_type {
-            0 => Cel::new_raw(&header.color_depth, raw),
-            1 => Cel::new_linked(raw),
-            2 => Cel::new_compressed(&header.color_depth, raw),
+            0 => Cel::Raw(RawCel::new(&header.color_depth, raw)),
+            1 => Cel::Linked(LinkedCel::new(raw)),
+            2 => Cel::Raw(RawCel::from_compressed(&header.color_depth, raw)),
             _ => panic!("Invalid cel type!"),
+        }
+    }
+
+    fn layer_index(&self) -> u16 {
+        match self {
+            Cel::Raw(c) => c.base.layer_index,
+            Cel::Linked(c) => c.base.layer_index,
+            Cel::Compressed(c) => c.base.layer_index,
         }
     }
 }
@@ -491,9 +579,46 @@ impl Ase {
     /// data with the configured opacity. If there are multiple frames, this procedure is repeated
     /// for each frame generating a strip of frame data.
     pub fn render(&self) -> Vec<u8> {
-        Vec::new()
+        let width = self.header.width as usize;
+        let height = self.header.height as usize;
+        let color_depth = &self.header.color_depth;
+        println!("Header width: {}, Header height: {}", width, height);
+        let mut image_data: Vec<u8> = vec![0; width * height * color_depth.offset()];
+        println!("Image data length: {}", image_data.len());
+
+        for frame in &self.frames {
+            for layer in &frame.layers {
+                for cel in &layer.cels {
+                    match cel {
+                        Cel::Raw(c) => {
+                            for (i, pixel) in c.pixels.iter().enumerate() {
+                                match pixel {
+                                    Pixel::RGBA{r, g, b, a} => {
+                                        let idx = c.map_pixel(i, width) * color_depth.offset();
+                                        image_data[idx] = *r;
+                                        image_data[idx+1] = *g;
+                                        image_data[idx+2] = *b;
+                                        image_data[idx+3] = *a;
+                                    },
+                                    Pixel::GrayScale{value, alpha} => {
+                                        image_data.push(*value);
+                                        image_data.push(*alpha);
+                                    },
+                                    Pixel::Indexed{index} => image_data.push(*index),
+                                }
+                            }
+                            println!("Found a raw cel!")
+                        }
+                        _ => println!("Non pixel cel"),
+                    }
+                }
+            }
+        }
+
+        image_data
     }
 }
+
 
 impl Header {
     pub fn new(raw: &[u8]) -> Header {
@@ -553,6 +678,8 @@ fn read_string(bytes: &[u8]) -> (String, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::png::PNGEncoder;
+    use std::fs;
 
     #[test]
     fn it_works() {
@@ -588,5 +715,17 @@ mod tests {
         let test_bytes = include_bytes!("../test.ase");
         let ase = Ase::new(test_bytes);
         println!("{:?}", ase);
+    }
+
+    #[test]
+    fn test_render_image() {
+        let test_bytes = include_bytes!("../test.ase");
+        let ase = Ase::new(test_bytes);
+        let image_data = ase.render();
+        let file = fs::File::create("output.png").unwrap();
+        let encoder = PNGEncoder::new(file);
+        let width = ase.header.width as u32;
+        let height = ase.header.height as u32;
+        encoder.encode(&image_data, width, height, image::ColorType::RGBA(8)).unwrap();
     }
 }
